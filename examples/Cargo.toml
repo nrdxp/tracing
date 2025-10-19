@@ -65,3 +65,8 @@ tracing-subscriber = { path = "../tracing-subscriber", version = "0.3.0", featur
 
 [lints]
 workspace = true
+
+
+[[example]]
+name = "hierarchical_formatter"
+path = "hierarchical_formatter.rs"

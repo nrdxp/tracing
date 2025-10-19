@@ -53,7 +53,9 @@
 //!   similar to the [`env_logger` crate]. **Requires "std"**.
 //! - `fmt`: Enables the [`fmt`] module, which provides a subscriber
 //!   implementation for printing formatted representations of trace events.
-//!   Enabled by default. **Requires "registry" and "std"**.
+//!   This includes the `hierarchical` formatter, which is designed to render
+//!   `tracing` events and spans in a way that emphasizes the hierarchical
+//!   structure of the data. Enabled by default. **Requires "registry" and "std"**.
 //! - `ansi`: Enables `fmt` support for ANSI terminal colors. Enabled by
 //!   default.
 //! - `registry`: enables the [`registry`] module. Enabled by default.

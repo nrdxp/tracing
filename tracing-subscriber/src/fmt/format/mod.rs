@@ -57,6 +57,9 @@ mod json;
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub use json::*;
 
+mod hierarchical;
+pub use hierarchical::*;
+
 #[cfg(feature = "ansi")]
 mod pretty;
 #[cfg(feature = "ansi")]
@@ -694,6 +697,24 @@ impl<F, T> Format<F, T> {
             display_thread_name: self.display_thread_name,
             display_filename: self.display_filename,
             display_line_number: self.display_line_number,
+        }
+    }
+
+    /// Use a hierarchical, human-readable output format.
+    ///
+    /// See [`Hierarchical`].
+    pub fn hierarchical(self) -> Format<Hierarchical, T> {
+        Format {
+            format: Hierarchical::default(),
+            timer: self.timer,
+            ansi: self.ansi,
+            display_target: self.display_target,
+            display_timestamp: self.display_timestamp,
+            display_level: self.display_level,
+            display_thread_id: self.display_thread_id,
+            display_thread_name: self.display_thread_name,
+            display_filename: true,
+            display_line_number: true,
         }
     }
 
