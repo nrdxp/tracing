@@ -57,8 +57,7 @@ mod json;
 #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
 pub use json::*;
 
-mod hierarchical;
-pub use hierarchical::*;
+pub mod hierarchical;
 
 #[cfg(feature = "ansi")]
 mod pretty;
@@ -450,6 +449,7 @@ impl<'writer> Writer<'writer> {
         Self { is_ansi, ..self }
     }
 
+
     /// Return a new `Writer` that mutably borrows `self`.
     ///
     /// This can be used to temporarily borrow a `Writer` to pass a new `Writer`
@@ -700,23 +700,6 @@ impl<F, T> Format<F, T> {
         }
     }
 
-    /// Use a hierarchical, human-readable output format.
-    ///
-    /// See [`Hierarchical`].
-    pub fn hierarchical(self) -> Format<Hierarchical, T> {
-        Format {
-            format: Hierarchical::default(),
-            timer: self.timer,
-            ansi: self.ansi,
-            display_target: self.display_target,
-            display_timestamp: self.display_timestamp,
-            display_level: self.display_level,
-            display_thread_id: self.display_thread_id,
-            display_thread_name: self.display_thread_name,
-            display_filename: true,
-            display_line_number: true,
-        }
-    }
 
     /// Use the given [`timer`] for log message timestamps.
     ///
@@ -839,6 +822,24 @@ impl<F, T> Format<F, T> {
     pub fn with_source_location(self, display_location: bool) -> Self {
         self.with_line_number(display_location)
             .with_file(display_location)
+    }
+
+    /// Use a hierarchical, human-readable output format.
+    ///
+    /// See [`Hierarchical`].
+    pub fn hierarchical(self) -> Format<hierarchical::Hierarchical, T> {
+        Format {
+            format: hierarchical::Hierarchical::default(),
+            timer: self.timer,
+            ansi: self.ansi,
+            display_target: self.display_target,
+            display_timestamp: self.display_timestamp,
+            display_level: self.display_level,
+            display_thread_id: self.display_thread_id,
+            display_thread_name: self.display_thread_name,
+            display_filename: true,
+            display_line_number: true,
+        }
     }
 
     #[inline]

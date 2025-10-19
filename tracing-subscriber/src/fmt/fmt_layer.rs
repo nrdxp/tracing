@@ -833,20 +833,32 @@ where
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
 
-        if extensions.get_mut::<FormattedFields<N>>().is_none() {
-            let mut fields = FormattedFields::<N>::new(String::new());
-            if self
-                .fmt_fields
-                .format_fields(fields.as_writer().with_ansi(self.is_ansi), attrs)
-                .is_ok()
+        if TypeId::of::<N>() == TypeId::of::<format::hierarchical::HierarchicalFields>() {
+            if extensions
+                .get_mut::<format::hierarchical::HierarchicalMap>()
+                .is_none()
             {
-                fields.was_ansi = self.is_ansi;
-                extensions.insert(fields);
-            } else {
-                eprintln!(
-                    "[tracing-subscriber] Unable to format the following event, ignoring: {:?}",
-                    attrs
-                );
+                let mut visitor = format::hierarchical::HierarchicalVisitor::new();
+                attrs.record(&mut visitor);
+                let (_, fields) = visitor.finish();
+                extensions.insert(format::hierarchical::HierarchicalMap(fields));
+            }
+        } else {
+            if extensions.get_mut::<FormattedFields<N>>().is_none() {
+                let mut fields = FormattedFields::<N>::new(String::new());
+                if self
+                    .fmt_fields
+                    .format_fields(fields.as_writer().with_ansi(self.is_ansi), attrs)
+                    .is_ok()
+                {
+                    fields.was_ansi = self.is_ansi;
+                    extensions.insert(fields);
+                } else {
+                    eprintln!(
+                        "[tracing-subscriber] Unable to format the following event, ignoring: {:?}",
+                        attrs
+                    );
+                }
             }
         }
 
@@ -869,19 +881,28 @@ where
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
-        if let Some(fields) = extensions.get_mut::<FormattedFields<N>>() {
-            let _ = self.fmt_fields.add_fields(fields, values);
-            return;
-        }
+        if TypeId::of::<N>() == TypeId::of::<format::hierarchical::HierarchicalFields>() {
+            if let Some(map) = extensions.get_mut::<format::hierarchical::HierarchicalMap>() {
+                let mut visitor = format::hierarchical::HierarchicalVisitor::new();
+                values.record(&mut visitor);
+                let (_, new_fields) = visitor.finish();
+                format::hierarchical::merge_fields(&mut map.0, new_fields);
+            }
+        } else {
+            if let Some(fields) = extensions.get_mut::<FormattedFields<N>>() {
+                let _ = self.fmt_fields.add_fields(fields, values);
+                return;
+            }
 
-        let mut fields = FormattedFields::<N>::new(String::new());
-        if self
-            .fmt_fields
-            .format_fields(fields.as_writer().with_ansi(self.is_ansi), values)
-            .is_ok()
-        {
-            fields.was_ansi = self.is_ansi;
-            extensions.insert(fields);
+            let mut fields = FormattedFields::<N>::new(String::new());
+            if self
+                .fmt_fields
+                .format_fields(fields.as_writer().with_ansi(self.is_ansi), values)
+                .is_ok()
+            {
+                fields.was_ansi = self.is_ansi;
+                extensions.insert(fields);
+            }
         }
     }
 
