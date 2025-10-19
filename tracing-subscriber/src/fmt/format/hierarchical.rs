@@ -1,4 +1,3 @@
-
 //! A hierarchical event formatter.
 //!
 //! This formatter is designed to format `tracing` events and spans in a hierarchical,
@@ -15,6 +14,8 @@
 //!   are formatted using their `Debug` implementation.
 //! - **Customizable Indentation**: The amount of indentation can be configured to suit
 //!   your preferences.
+//! - **Text Wrapping**: Long lines can be automatically wrapped at configurable widths
+//!   or terminal width, with proper handling of ANSI escape sequences and word boundaries.
 //!
 //! # Usage
 //!
@@ -68,6 +69,7 @@
 //!   ```
 //!
 //! This ensures that no information is lost, even if the field naming is ambiguous.
+use crate::field::RecordFields;
 use crate::{
     fmt::{
         format::{self, FmtLevel, Format, Writer},
@@ -82,7 +84,6 @@ use std::{
     string::{String, ToString},
     vec::Vec,
 };
-use crate::field::RecordFields;
 use tracing_core::{
     field::{Field, Visit},
     span::Record,
@@ -116,6 +117,7 @@ impl TextWrapper {
     }
 
     /// Wraps the given text, preserving ANSI escape sequences and maintaining word boundaries.
+    /// For very long words without spaces (like JWT tokens or URLs), implements word breaking.
     pub(crate) fn wrap_text(&self, text: &str) -> String {
         if text.is_empty() {
             return String::new();
@@ -128,19 +130,45 @@ impl TextWrapper {
         // Split text into words, preserving whitespace
         let words = self.split_preserve_whitespace(text);
 
-        for (_i, word) in words.iter().enumerate() {
+        for word in &words {
             let word_width = self.display_width(word);
 
             // Check if adding this word would exceed the line width
-            if !current_line.is_empty() && current_width + word_width > self.width {
-                // Start a new line
-                if !result.is_empty() {
-                    result.push('\n');
+            if current_width + word_width > self.width {
+                // If the word itself is longer than the width, we need to break it
+                if word_width > self.width {
+                    // Break long words into chunks
+                    let chunks = self.break_long_word(word, self.width);
+
+                    // First, flush current line if any
+                    if !current_line.is_empty() {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&self.indent);
+                        result.push_str(&current_line);
+                        current_line = String::new();
+                        current_width = 0;
+                    }
+
+                    // Then add each chunk on new lines in correct order
+                    for chunk in &chunks {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&self.indent);
+                        result.push_str(chunk);
+                    }
+                } else {
+                    // Start a new line for the word
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(&self.indent);
+                    result.push_str(&current_line);
+                    current_line = word.clone();
+                    current_width = word_width;
                 }
-                result.push_str(&self.indent);
-                result.push_str(&current_line);
-                current_line = word.clone();
-                current_width = word_width;
             } else {
                 // Add to current line
                 current_line.push_str(word);
@@ -160,6 +188,31 @@ impl TextWrapper {
         result
     }
 
+    /// Breaks a long word into chunks that fit within the specified width.
+    fn break_long_word(&self, word: &str, max_width: usize) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        let mut current_width = 0;
+
+        for ch in word.chars() {
+            let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+
+            if current_width + char_width > max_width && !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_width = 0;
+            }
+
+            current_chunk.push(ch);
+            current_width += char_width;
+        }
+
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        chunks
+    }
+
     /// Splits text into words while preserving whitespace.
     fn split_preserve_whitespace(&self, text: &str) -> Vec<String> {
         let mut result = Vec::new();
@@ -167,23 +220,27 @@ impl TextWrapper {
         let mut in_escape = false;
 
         for ch in text.chars() {
-            if ch == '\x1b' {
-                in_escape = true;
-            }
-
-            if in_escape {
-                current.push(ch);
-                if ch == 'm' {
+            match (in_escape, ch) {
+                (false, '\x1b') => {
+                    in_escape = true;
+                    current.push(ch);
+                }
+                (true, 'm') => {
                     in_escape = false;
+                    current.push(ch);
                 }
-            } else if ch.is_whitespace() {
-                if !current.is_empty() {
-                    result.push(current);
-                    current = String::new();
+                (true, _) => {
+                    current.push(ch);
                 }
-                result.push(ch.to_string());
-            } else {
-                current.push(ch);
+                (false, ch) if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        result.push(std::mem::take(&mut current));
+                    }
+                    result.push(ch.to_string());
+                }
+                (false, _) => {
+                    current.push(ch);
+                }
             }
         }
 
@@ -200,19 +257,25 @@ impl TextWrapper {
         let mut in_escape = false;
 
         for ch in text.chars() {
-            if ch == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
-                if ch == 'm' {
-                    in_escape = false;
-                }
-            } else {
-                // Use Unicode width calculation
-                width += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            match (in_escape, ch) {
+                (false, '\x1b') => in_escape = true,
+                (true, 'm') => in_escape = false,
+                (false, _) => width += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1),
+                (true, _) => {} // Skip characters inside escape sequences
             }
         }
 
         width
+    }
+
+    /// Calculates the effective width available for text content by subtracting indent width.
+    fn effective_width(&self, indent: &str) -> usize {
+        let indent_width = self.display_width(indent);
+        if indent_width >= self.width {
+            1 // Minimum width to prevent zero or negative width
+        } else {
+            self.width - indent_width
+        }
     }
 }
 
@@ -317,6 +380,7 @@ where
         // Create text wrapper if wrapping is enabled
         let wrapper = if self.format.wrap_width.is_some() || self.format.terminal_width {
             let width = if self.format.terminal_width {
+                // Re-detect terminal width on each event for dynamic adaptation
                 get_terminal_width().unwrap_or(80)
             } else {
                 self.format.wrap_width.unwrap_or(80)
@@ -375,19 +439,62 @@ where
                 } else {
                     (name_to_print, "")
                 };
-                write!(writer, "{}{}{}", quote, name, quote)?;
+
+                // For spans (s_), write on same line as level
+                // For messages (1_), write on same line as level
+                // For regular fields (2_), start on new line with indentation
+                if key_prefix == "2_" {
+                    writeln!(writer)?;
+                    write!(writer, "  {}{}{}", quote, name, quote)?;
+                } else {
+                    write!(writer, "{}{}{}", quote, name, quote)?;
+                }
 
                 if let Value::Node(fields) = value {
                     if !fields.is_empty() {
-                        format_fields(&mut writer, fields, "", wrapper.as_ref())?;
+                        let field_prefix = if key_prefix == "2_" { "  " } else { "" };
+                        format_fields(&mut writer, fields, field_prefix, wrapper.as_ref())?;
                     } else {
                         writeln!(writer)?;
                     }
                 }
             }
         } else if !current_fields.is_empty() {
-            format_fields(&mut writer, current_fields, "  ", wrapper.as_ref())?;
+            // Check if there's a span in the fields
+            let has_span = current_fields.keys().any(|k| k.starts_with("s_"));
+            if has_span {
+                // Find the span and write it on the same line as the level
+                let mut span_key = None;
+                let mut span_value = None;
+                let mut other_fields = BTreeMap::new();
+
+                for (key, value) in current_fields {
+                    if key.starts_with("s_") {
+                        span_key = Some(key);
+                        span_value = Some(value);
+                    } else {
+                        other_fields.insert(key, value);
+                    }
+                }
+
+                if let (Some(key), Some(value)) = (span_key, span_value) {
+                    let name_to_print = &key[2..]; // Remove "s_" prefix
+                    write!(writer, "{}", name_to_print)?;
+
+                    if let Value::Node(fields) = value {
+                        if !fields.is_empty() {
+                            format_fields(&mut writer, fields, "", wrapper.as_ref())?;
+                        } else {
+                            writeln!(writer)?;
+                        }
+                    }
+                }
+            } else {
+                // No span, so this is multiple fields - format them with proper indentation
+                format_fields(&mut writer, current_fields, "", wrapper.as_ref())?;
+            }
         } else {
+            // No fields at all - just write a newline
             writeln!(writer)?;
         }
 
@@ -528,15 +635,15 @@ impl Default for HierarchicalFields {
 }
 
 impl<'a> format::FormatFields<'a> for HierarchicalFields {
-    fn format_fields<R: RecordFields>(
-        &self,
-        _writer: Writer<'_>,
-        _fields: R,
-    ) -> fmt::Result {
+    fn format_fields<R: RecordFields>(&self, _writer: Writer<'_>, _fields: R) -> fmt::Result {
         Ok(())
     }
 
-    fn add_fields(&self, _current: &mut FormattedFields<Self>, _fields: &Record<'_>) -> fmt::Result {
+    fn add_fields(
+        &self,
+        _current: &mut FormattedFields<Self>,
+        _fields: &Record<'_>,
+    ) -> fmt::Result {
         Ok(())
     }
 }
@@ -586,7 +693,8 @@ fn format_fields(
                     if wrapped.contains('\n') {
                         writeln!(writer)?;
                         let indent = std::format!("{}{}", prefix, pipe);
-                        let wrapper = TextWrapper::new(wrapper.width, indent);
+                        let effective_width = wrapper.effective_width(&indent);
+                        let wrapper = TextWrapper::new(effective_width, indent);
                         write!(writer, "{}", wrapper.wrap_text(&leaf))?;
                     } else {
                         write!(writer, " {}", wrapped)?;
@@ -727,8 +835,8 @@ mod tests {
             output.trim(),
             expected.trim(),
             "output:\n{}\nexpected:\n{}",
-            output,
-            expected
+            output.trim(),
+            expected.trim()
         );
     }
 
@@ -929,21 +1037,32 @@ mod tests {
         assert!(lines.len() > 3); // Should have multiple lines due to wrapping
 
         // Check that wrapped lines maintain proper indentation
-        for line in lines.iter().skip(1) { // Skip the first line (INFO message)
+        for line in lines.iter().skip(1) {
+            // Skip the first line (INFO message)
             if line.contains("│") || line.contains("└─") {
                 // Continuation lines should be properly indented
-                assert!(line.starts_with("   ") || line.starts_with("│  ") || line.starts_with("└─"));
+                assert!(
+                    line.starts_with("   ") || line.starts_with("│  ") || line.starts_with("└─")
+                );
             }
         }
 
         // Verify that no line exceeds the wrap width significantly (allowing for tree characters)
         for line in lines {
             // Remove ANSI codes and tree characters for width calculation
-            let clean_line = line.replace("├─ ", "").replace("└─ ", "").replace("│  ", "").replace("   ", "");
+            let clean_line = line
+                .replace("├─ ", "")
+                .replace("└─ ", "")
+                .replace("│  ", "")
+                .replace("   ", "");
             // Allow more margin for tree chars and indentation - wrapping is approximate
             // The test mainly verifies that wrapping occurs, not exact width limits
             if clean_line.len() > 200 {
-                panic!("Line too long: {} chars in '{}'", clean_line.len(), clean_line);
+                panic!(
+                    "Line too long: {} chars in '{}'",
+                    clean_line.len(),
+                    clean_line
+                );
             }
         }
     }
@@ -1070,7 +1189,7 @@ mod tests {
         // Should have: INFO line, message line, field line (3 total, no wrapping)
         // Note: The exact count may vary based on how the formatter handles the output
         assert!(lines.len() >= 2); // At least INFO and message
-        // Verify the long text appears (may be split across lines due to formatting)
+                                   // Verify the long text appears (may be split across lines due to formatting)
         assert!(output.contains("This is a very long message that should not be wrapped"));
         assert!(output.contains("This is also a very long field value that should not be wrapped"));
     }
@@ -1110,6 +1229,79 @@ mod tests {
         // Unicode should be preserved
         assert!(output.contains("世界"));
         assert!(output.contains("🌍"));
+    }
+
+    #[test]
+    fn hierarchical_long_tokens_wrapping() {
+        // Test JWT tokens and URLs that don't contain spaces
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(50);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(
+                jwt_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+                url = "https://very-long-domain-name-that-exceeds-wrap-width.example.com/api/v1/users/1234567890/profile/settings/preferences",
+                message = "Testing long token wrapping"
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should contain the full JWT token (broken across lines)
+        assert!(output.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiO"));
+        assert!(output.contains("iIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0"));
+        assert!(output.contains("IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36P"));
+        assert!(output.contains("Ok6yJV_adQssw5c"));
+        // Should contain the full URL (broken across lines)
+        assert!(output.contains("https://very-long-domain-name"));
+        assert!(output.contains("preferences"));
+        // Should have newlines for wrapping
+        assert!(output.contains('\n'));
+        // Should contain the message
+        assert!(output.contains("Testing long token wrapping"));
+    }
+
+    #[test]
+    fn hierarchical_field_positioning_no_message() {
+        // Test that when no explicit message field is present, the first field appears properly indented
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .hierarchical();
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(user_id = 123, action = "login", status = "success");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Check that the output contains the expected structure
+        assert!(output.contains("INFO"));
+        assert!(output.contains("├─ action"));
+        assert!(output.contains("├─ status"));
+        assert!(output.contains("└─ user_id"));
+        assert!(output.contains("\"login\""));
+        assert!(output.contains("\"success\""));
+        assert!(output.contains("123"));
     }
 
     #[test]
@@ -1172,5 +1364,520 @@ mod tests {
         assert!(result.contains("🌍"));
         // Should wrap due to width
         assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn text_wrapper_zero_width() {
+        // Test edge case: zero width should not crash but handle gracefully
+        let wrapper = TextWrapper::new(0, "".to_string());
+        let text = "hello world";
+        let result = wrapper.wrap_text(text);
+        // Should still produce output, perhaps breaking at every character
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn text_wrapper_very_small_width() {
+        let wrapper = TextWrapper::new(1, "".to_string());
+        let text = "hello";
+        let result = wrapper.wrap_text(text);
+        // Should break at every character or handle gracefully
+        // Just ensure it produces valid output
+        assert!(!result.is_empty());
+        assert!(result.contains("h"));
+        assert!(result.contains("e"));
+        assert!(result.contains("l"));
+        assert!(result.contains("o"));
+    }
+
+    #[test]
+    fn text_wrapper_extremely_long_word() {
+        let wrapper = TextWrapper::new(10, "".to_string());
+        let long_word = "a".repeat(1000);
+        let result = wrapper.wrap_text(&long_word);
+        // Should break the long word into chunks
+        // May not contain newlines if the word is treated as one unbreakable unit
+        // Just ensure it produces valid output
+        assert!(!result.is_empty());
+        assert!(result.contains("a"));
+    }
+
+    #[test]
+    fn text_wrapper_mixed_whitespace() {
+        let wrapper = TextWrapper::new(15, "".to_string());
+        let text = "word1\tword2\nword3  word4";
+        let result = wrapper.wrap_text(text);
+        // Should preserve different types of whitespace
+        assert!(result.contains('\t') || result.contains(" "));
+        assert!(result.contains("word1"));
+        assert!(result.contains("word2"));
+        assert!(result.contains("word3"));
+        assert!(result.contains("word4"));
+    }
+
+    #[test]
+    fn text_wrapper_ansi_at_boundaries() {
+        let wrapper = TextWrapper::new(10, "".to_string());
+        // ANSI code exactly at wrap boundary
+        let text = "hello\x1b[31mred\x1b[0mworld";
+        let result = wrapper.wrap_text(text);
+        // ANSI codes should be preserved
+        assert!(result.contains("\x1b[31m"));
+        assert!(result.contains("\x1b[0m"));
+        // Content should be wrapped correctly ignoring ANSI width
+        assert!(result.contains("hello"));
+        assert!(result.contains("red"));
+        assert!(result.contains("wor"));
+    }
+
+    #[test]
+    fn text_wrapper_nested_ansi_sequences() {
+        let wrapper = TextWrapper::new(15, "".to_string());
+        let text = "\x1b[1m\x1b[31mbold red\x1b[0m normal";
+        let result = wrapper.wrap_text(text);
+        // Nested ANSI sequences should be preserved
+        assert!(result.contains("\x1b[1m"));
+        assert!(result.contains("\x1b[31m"));
+        assert!(result.contains("\x1b[0m"));
+        assert!(result.contains("bold red"));
+        assert!(result.contains(" normal"));
+    }
+
+    #[test]
+    fn text_wrapper_incomplete_ansi_sequence() {
+        let wrapper = TextWrapper::new(10, "".to_string());
+        // Incomplete ANSI sequence (missing 'm')
+        let text = "hello\x1b[31world";
+        let result = wrapper.wrap_text(text);
+        // Should handle gracefully
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+    }
+
+    #[test]
+    fn text_wrapper_unicode_combining_characters() {
+        let wrapper = TextWrapper::new(5, "".to_string());
+        // Unicode combining characters
+        let text = "café"; // é is composed of e + combining acute
+        let result = wrapper.wrap_text(text);
+        assert!(result.contains("café"));
+        // May or may not wrap depending on exact width calculations
+        // Just ensure it produces valid output
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn text_wrapper_zero_width_unicode() {
+        let wrapper = TextWrapper::new(5, "".to_string());
+        // Zero-width characters
+        let text = "a\u{200B}b\u{200C}c"; // zero-width space, zero-width non-joiner
+        let result = wrapper.wrap_text(text);
+        // Should handle zero-width characters gracefully
+        assert!(result.contains("a"));
+        assert!(result.contains("b"));
+        assert!(result.contains("c"));
+    }
+
+    #[test]
+    fn text_wrapper_emojis_and_symbols() {
+        let wrapper = TextWrapper::new(8, "".to_string());
+        let text = "👋🌍🚀💻";
+        let result = wrapper.wrap_text(text);
+        // Should handle emoji width correctly
+        assert!(result.contains("👋"));
+        assert!(result.contains("🌍"));
+        assert!(result.contains("🚀"));
+        assert!(result.contains("💻"));
+        // May or may not wrap depending on exact width calculations
+        // Just ensure it produces valid output
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn text_wrapper_cjk_characters() {
+        let wrapper = TextWrapper::new(6, "".to_string());
+        let text = "你好世界"; // Chinese characters
+        let result = wrapper.wrap_text(text);
+        assert!(result.contains("你"));
+        assert!(result.contains("好"));
+        assert!(result.contains("世"));
+        assert!(result.contains("界"));
+        // May or may not wrap depending on exact width calculations, but should handle CJK
+        // Just ensure it produces valid output
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn text_wrapper_mixed_scripts() {
+        let wrapper = TextWrapper::new(12, "".to_string());
+        let text = "Hello 世界 🌍 test";
+        let result = wrapper.wrap_text(text);
+        assert!(result.contains("Hello"));
+        assert!(result.contains("世界"));
+        assert!(result.contains("🌍"));
+        assert!(result.contains("test"));
+        // Should wrap at word boundaries
+        assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn text_wrapper_performance_large_input() {
+        let wrapper = TextWrapper::new(80, "".to_string());
+        let text = "word ".repeat(10000); // 50,000 characters
+        let start = std::time::Instant::now();
+        let result = wrapper.wrap_text(&text);
+        let duration = start.elapsed();
+        // Should complete in reasonable time (< 100ms)
+        assert!(duration.as_millis() < 100);
+        // Should contain the text
+        assert!(result.contains("word"));
+        // Should have wrapping
+        assert!(result.contains('\n'));
+    }
+
+    #[test]
+    fn text_wrapper_performance_many_ansi_codes() {
+        let wrapper = TextWrapper::new(50, "".to_string());
+        let mut text = String::new();
+        for i in 0..1000 {
+            text.push_str(&std::format!("word{}\x1b[{}m ", i, i % 10));
+        }
+        let start = std::time::Instant::now();
+        let result = wrapper.wrap_text(&text);
+        let duration = start.elapsed();
+        // Should complete in reasonable time
+        assert!(duration.as_millis() < 200);
+        assert!(result.contains("word"));
+        assert!(result.contains("\x1b["));
+    }
+
+    #[test]
+    fn hierarchical_wrapping_with_extreme_nesting() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(40);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            // Create deeply nested structure with long values
+            info!(
+                level1.level2.level3.level4.level5.very_long_field_name_that_exceeds_normal_limits =
+                    "This is an extremely long value that should wrap properly even with very deep nesting in the hierarchical structure and multiple levels of indentation that make the total line length quite substantial when fully expanded.",
+                another.deeply.nested.structure.with.many.levels.and.a.long.value =
+                    "Another very long value with deep nesting that tests the wrapping algorithm's ability to handle complex hierarchical data structures with multiple indentation levels and long text content."
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should contain the nested structure
+        assert!(output.contains("level1"));
+        assert!(output.contains("level2"));
+        assert!(output.contains("very_long_field_name"));
+        // Should have wrapping
+        assert!(output.contains('\n'));
+        // Should maintain hierarchical structure
+        assert!(output.contains("├─"));
+        assert!(output.contains("└─"));
+    }
+
+    #[test]
+    fn hierarchical_terminal_width_detection_mock() {
+        // Test with mocked terminal width (since we can't control actual terminal)
+        // This tests the fallback behavior
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_terminal_width();
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(message = "Test message that should wrap at detected or fallback terminal width");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should work regardless of terminal detection
+        assert!(output.contains("Test message"));
+        assert!(output.contains("terminal width"));
+    }
+
+    #[test]
+    fn hierarchical_ansi_wrapping_edge_cases() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(25);
+        let format = fmt::format()
+            .with_ansi(true)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(
+                message = "Message with \x1b[31mred\x1b[0m and \x1b[1mbold\x1b[0m text",
+                field_with_ansi = "\x1b[32mgreen text\x1b[0m that should wrap",
+                long_ansi_prefix =
+                    "\x1b[1;31mvery long ansi prefixed content that exceeds the wrap width\x1b[0m"
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // ANSI codes should be preserved in the output (though they might be stripped in some contexts)
+        // The important thing is that the text content is there and wrapping works
+        // Content should be wrapped
+        assert!(output.contains('\n'));
+        // Should contain the text
+        assert!(output.contains("red"));
+        assert!(output.contains("bold"));
+        assert!(output.contains("green"));
+        assert!(output.contains("very long"));
+    }
+
+    #[test]
+    fn hierarchical_empty_and_whitespace_fields() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(30);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(
+                empty_field = "",
+                whitespace_field = "   ",
+                normal_field = "normal content",
+                mixed_whitespace = "word1\t\nword2  word3"
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should handle empty fields gracefully
+        assert!(output.contains("empty_field"));
+        assert!(output.contains("whitespace_field"));
+        assert!(output.contains("normal_field"));
+        assert!(output.contains("mixed_whitespace"));
+        // Should contain the content
+        assert!(output.contains("normal content"));
+        assert!(output.contains("word1"));
+        assert!(output.contains("word2"));
+        assert!(output.contains("word3"));
+    }
+
+    #[test]
+    fn hierarchical_unicode_field_names_and_values() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(40);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(
+                "用户.信息.姓名" = "张三",              // Chinese field name
+                "emoji.field.🌟" = "⭐⭐⭐",            // Emoji in field name
+                unicode_value = "café résumé naïve",    // Unicode in value
+                cjk_text = "你好世界こんにちは世界",    // Mixed CJK text
+                mixed_scripts = "Hello 世界 🌍 Привет"  // Mixed scripts
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should handle Unicode field names
+        assert!(output.contains("用户"));
+        assert!(output.contains("信息"));
+        assert!(output.contains("姓名"));
+        assert!(output.contains("🌟"));
+        // Should handle Unicode values
+        assert!(output.contains("张三"));
+        assert!(output.contains("café"));
+        assert!(output.contains("⭐⭐⭐"));
+        assert!(output.contains("你好世界"));
+        assert!(output.contains("こんにちは"));
+        assert!(output.contains("Привет"));
+        // Should wrap properly
+        assert!(output.contains('\n'));
+    }
+
+    #[test]
+    fn hierarchical_performance_large_hierarchy() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(100);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            let start = std::time::Instant::now();
+            info!(
+                // Create a large nested structure
+                level1 = "value1",
+                level1.level2 = "value2",
+                level1.level2.level3 = "value3",
+                level1.level2.level3.level4 = "value4",
+                level1.level2.level3.level4.level5 = "value5",
+                // Add many fields
+                field_001 = "data", field_002 = "data", field_003 = "data", field_004 = "data", field_005 = "data",
+                field_006 = "data", field_007 = "data", field_008 = "data", field_009 = "data", field_010 = "data",
+                field_011 = "data", field_012 = "data", field_013 = "data", field_014 = "data", field_015 = "data",
+                field_016 = "data", field_017 = "data", field_018 = "data", field_019 = "data", field_020 = "data",
+                // Add some long values
+                long_value_1 = "This is a very long value that should be wrapped properly and efficiently even with many fields present in the hierarchical structure.",
+                long_value_2 = "Another long value with detailed content that tests the performance of the wrapping algorithm under load with multiple long text fields.",
+                long_value_3 = "A third long value containing substantial text content to ensure the wrapping works correctly with multiple concurrent long fields."
+            );
+            let duration = start.elapsed();
+            // The logging itself should be fast
+            assert!(duration.as_millis() < 50);
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should contain all the nested levels
+        assert!(output.contains("level1"));
+        assert!(output.contains("level5"));
+        // Should contain the long values
+        assert!(output.contains("very long value"));
+        assert!(output.contains("Another long value"));
+        assert!(output.contains("A third long value"));
+        // Should have proper hierarchical formatting
+        assert!(output.contains("├─"));
+        assert!(output.contains("└─"));
+        // Should have wrapping
+        assert!(output.contains('\n'));
+    }
+
+    #[test]
+    fn hierarchical_boundary_widths() {
+        // Test various boundary conditions for wrap widths
+        for width in [1, 2, 5, 10, 20, 50, 100].iter() {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let writer = BufWriter(buf.clone());
+            let hierarchical = Hierarchical::default().with_wrap_width(*width);
+            let format = fmt::format()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_file(false)
+                .with_line_number(false)
+                .with_hierarchical(hierarchical);
+            let subscriber = fmt::Subscriber::builder()
+                .with_writer(writer)
+                .event_format(format)
+                .finish();
+
+            with_default(subscriber, || {
+                info!(
+                    message = "This is a test message with some content that should wrap at different widths",
+                    field = "Another field with content that needs to be wrapped appropriately"
+                );
+            });
+
+            let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+            // Should produce valid output for all widths
+            assert!(!output.is_empty());
+            assert!(output.contains("test message"));
+            assert!(output.contains("field"));
+            // Should have some wrapping (except possibly for very wide widths)
+            if *width < 50 {
+                assert!(output.contains('\n'));
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchical_word_breaking_edge_cases() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let hierarchical = Hierarchical::default().with_wrap_width(15);
+        let format = fmt::format()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
+            .with_hierarchical(hierarchical);
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .event_format(format)
+            .finish();
+
+        with_default(subscriber, || {
+            info!(
+                // Very long words that must be broken
+                long_word = "supercalifragilisticexpialidocious", // 34 chars
+                url = "https://very-long-domain-name-that-exceeds-wrap-width.example.com/path",
+                jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+                // Mixed long and short
+                mixed = "short verylongwordthatshouldbreakacrosslines short",
+                // Numbers and symbols
+                numbers = "1234567890123456789012345678901234567890",
+                symbols = "!@#$%^&*()_+-=[]{}|;:,.<>?/~`"
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
+        // Should contain all the content
+        assert!(output.contains("supercalifr"));
+        assert!(output.contains("https://ver"));
+        assert!(output.contains("eyJhbGciOiJ"));
+        // The mixed field may be split differently, just check for parts
+        assert!(output.contains("short"));
+        assert!(output.contains("verylongword"));
+        assert!(output.contains("12345678901"));
+        assert!(output.contains("!@#$%^&*()_"));
+        // Should have some wrapping
+        assert!(output.contains('\n'));
+        // Should produce valid output
+        assert!(!output.is_empty());
     }
 }

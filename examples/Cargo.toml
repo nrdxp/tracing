@@ -6,7 +6,8 @@ edition = "2018"
 rust-version = "1.64.0"
 
 [features]
-default = []
+default = ["term"]
+term = ["tracing-subscriber/terminal_size"]
 
 [dev-dependencies]
 

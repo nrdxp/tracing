@@ -6,11 +6,17 @@ use tracing::info;
 use tracing_subscriber::{fmt, fmt::format::hierarchical::Hierarchical, prelude::*};
 
 fn main() {
-    // println!("=== Fixed Width Wrapping (60 chars) ===");
-    demonstrate_fixed_width();
+    #[cfg(not(feature = "term"))]
+    {
+        println!("=== Fixed Width Wrapping (60 chars) ===");
+        demonstrate_fixed_width();
+    }
 
-    println!("\n=== Terminal Width Wrapping (auto-detect) ===");
-    demonstrate_terminal_width();
+    #[cfg(feature = "term")]
+    {
+        println!("\n=== Terminal Width Wrapping (auto-detect) ===");
+        demonstrate_terminal_width();
+    }
 }
 
 /// Demonstrates fixed-width text wrapping at 60 characters.
@@ -18,6 +24,7 @@ fn main() {
 /// This approach uses `with_wrap_width(60)` to set a specific width.
 /// Use this when you want consistent formatting regardless of terminal size,
 /// such as in log files or when you need predictable output width.
+#[cfg(not(feature = "term"))]
 fn demonstrate_fixed_width() {
     // Configure hierarchical formatter with fixed text wrapping at 60 characters
     let format = fmt::format()
@@ -54,6 +61,7 @@ fn demonstrate_fixed_width() {
 /// to adapt to different terminal sizes, providing optimal readability in
 /// interactive terminal sessions. Falls back to 80 characters if terminal
 /// width cannot be detected.
+#[cfg(feature = "term")]
 fn demonstrate_terminal_width() {
     // Configure hierarchical formatter with automatic terminal width detection
     let format = fmt::format()
