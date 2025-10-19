@@ -70,3 +70,7 @@ workspace = true
 [[example]]
 name = "hierarchical_formatter"
 path = "hierarchical_formatter.rs"
+
+[[example]]
+name = "hierarchical_formatter_wrapping"
+path = "hierarchical_formatter_wrapping.rs"

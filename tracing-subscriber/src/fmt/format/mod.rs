@@ -842,6 +842,24 @@ impl<F, T> Format<F, T> {
         }
     }
 
+    /// Configure the hierarchical formatter.
+    ///
+    /// This method allows configuring the hierarchical formatter with custom settings.
+    pub fn with_hierarchical<F2>(self, hierarchical: F2) -> Format<F2, T> {
+        Format {
+            format: hierarchical,
+            timer: self.timer,
+            ansi: self.ansi,
+            display_target: self.display_target,
+            display_timestamp: self.display_timestamp,
+            display_level: self.display_level,
+            display_thread_id: self.display_thread_id,
+            display_thread_name: self.display_thread_name,
+            display_filename: self.display_filename,
+            display_line_number: self.display_line_number,
+        }
+    }
+
     #[inline]
     fn format_timestamp(&self, writer: &mut Writer<'_>) -> fmt::Result
     where
