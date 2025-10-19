@@ -148,8 +148,21 @@ where
             write!(writer, "{} ", fmt_level)?;
         }
 
-        let indent_amount = self.format.indent_amount;
-        let mut in_span = false;
+        let mut visitor = HierarchicalVisitor::new();
+        event.record(&mut visitor);
+        let (message, fields) = visitor.finish();
+
+        let mut current_fields = BTreeMap::new();
+        if let Some(message) = message {
+            let mut message_node = BTreeMap::new();
+            add_prefixed_fields(&mut message_node, fields, "2_");
+            current_fields.insert(
+                std::format!("1_{}", message.trim_matches('"')),
+                Value::Node(message_node),
+            );
+        } else {
+            add_prefixed_fields(&mut current_fields, fields, "2_");
+        }
 
         if let Some(span) = ctx.lookup_current() {
             let mut stack = Vec::new();
@@ -160,42 +173,42 @@ where
                 current = parent;
             }
 
-            for span_ref in stack.iter().rev() {
-                in_span = true;
-                write!(writer, "{}", span_ref.name())?;
-                if let Some(map) = span_ref.extensions().get::<HierarchicalMap>() {
-                    if !map.0.is_empty() {
-                        format_fields(&mut writer, map.0.clone(), 0, indent_amount)?;
-                    } else {
-                        writeln!(writer)?;
-                    }
-                } else {
-                    writeln!(writer)?;
+            for s in stack {
+                let mut new_fields = BTreeMap::new();
+                if let Some(map) = s.extensions().get::<HierarchicalMap>() {
+                    add_prefixed_fields(&mut new_fields, map.0.clone(), "0_");
                 }
+                merge_fields(&mut new_fields, current_fields);
+                current_fields = BTreeMap::new();
+                current_fields.insert(std::format!("s_{}", s.name()), Value::Node(new_fields));
             }
         }
 
-        let event_indent = if in_span { indent_amount } else { 0 };
-        write!(writer, "{}", " ".repeat(event_indent))?;
+        if current_fields.len() == 1 {
+            if let Some((key, value)) = current_fields.into_iter().next() {
+                let (key_prefix, name_to_print) = if key.len() > 2 && &key[1..2] == "_" {
+                    (&key[..2], &key[2..])
+                } else {
+                    ("", &key[..])
+                };
 
-        if self.display_target {
-            write!(writer, "{}:", meta.target())?;
-        }
+                let (name, quote) = if key_prefix == "1_" {
+                    (name_to_print, "\"")
+                } else {
+                    (name_to_print, "")
+                };
+                write!(writer, "{}{}{}", quote, name, quote)?;
 
-        let mut visitor = HierarchicalVisitor::new();
-        event.record(&mut visitor);
-        let (message, fields) = visitor.finish();
-
-        if let Some(message) = message {
-            write!(writer, "{}", message)?;
-        }
-
-        if !fields.is_empty() {
-            // The `event_indent` is the indentation for the message line, but
-            // `format_fields` will add its own indentation. We need to subtract
-            // one level of indentation.
-            let field_indent = event_indent.saturating_sub(indent_amount);
-            format_fields(&mut writer, fields, field_indent, indent_amount)?;
+                if let Value::Node(fields) = value {
+                    if !fields.is_empty() {
+                        format_fields(&mut writer, fields, "")?;
+                    } else {
+                        writeln!(writer)?;
+                    }
+                }
+            }
+        } else if !current_fields.is_empty() {
+            format_fields(&mut writer, current_fields, "  ")?;
         } else {
             writeln!(writer)?;
         }
@@ -298,7 +311,11 @@ impl Visit for HierarchicalVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.add_leaf(field, std::format!("{:?}", value));
+        if field.name() == "message" {
+            self.add_leaf(field, value.to_string());
+        } else {
+            self.add_leaf(field, std::format!("{:?}", value));
+        }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
@@ -351,20 +368,48 @@ impl<'a> format::FormatFields<'a> for HierarchicalFields {
 fn format_fields(
     writer: &mut Writer<'_>,
     fields: BTreeMap<String, Value>,
-    indent: usize,
-    indent_amount: usize,
+    prefix: &str,
 ) -> fmt::Result {
     if fields.is_empty() {
-        return writeln!(writer);
+        return Ok(());
     }
-    writeln!(writer)?;
+    if prefix.is_empty() {
+        writeln!(writer)?;
+    }
     let mut fields_iter = fields.into_iter().peekable();
     while let Some((key, value)) = fields_iter.next() {
-        write!(writer, "{}{}:", " ".repeat(indent + indent_amount), key)?;
+        let is_last = fields_iter.peek().is_none();
+        let branch = if is_last { "└─ " } else { "├─ " };
+        let pipe = if is_last { "   " } else { "│  " };
+
+        let (key_prefix, key_to_print) = if key.len() > 2 && key.get(1..2) == Some("_") {
+            (&key[..2], &key[2..])
+        } else {
+            ("", &key[..])
+        };
+
+        let (display_key, quote, colon) = match key_prefix {
+            "1_" => (key_to_print, "\"", ""),
+            "s_" => (key_to_print, "", ""),
+            _ => (key_to_print, "", ":"),
+        };
+
+        write!(
+            writer,
+            "{}{}{}{}{}{}",
+            prefix, branch, quote, display_key, quote, colon
+        )?;
+
         match value {
             Value::Leaf(leaf) => writeln!(writer, " {}", leaf)?,
             Value::Node(node) => {
-                format_fields(writer, node, indent + indent_amount, indent_amount)?;
+                if !node.is_empty() {
+                    writeln!(writer)?;
+                    let new_prefix = std::format!("{}{}", prefix, pipe);
+                    format_fields(writer, node, &new_prefix)?;
+                } else {
+                    writeln!(writer)?;
+                }
             }
         }
     }
@@ -386,6 +431,26 @@ pub(crate) fn merge_fields(target: &mut BTreeMap<String, Value>, source: BTreeMa
                     *target_val = source_val;
                 }
             },
+        }
+    }
+}
+
+fn add_prefixed_fields(
+    target: &mut BTreeMap<String, Value>,
+    source: BTreeMap<String, Value>,
+    prefix: &str,
+) {
+    for (key, value) in source {
+        let new_key = std::format!("{}{}", prefix, key);
+        match value {
+            Value::Node(node) => {
+                let mut new_node = BTreeMap::new();
+                add_prefixed_fields(&mut new_node, node, prefix);
+                target.insert(new_key, Value::Node(new_node));
+            }
+            leaf => {
+                target.insert(new_key, leaf);
+            }
         }
     }
 }
@@ -450,19 +515,19 @@ mod tests {
 
         let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
         let expected = r#"INFO "user logged in"
-  additional_info: "some value"
-  http:
-    request:
-      method: "POST"
-      path: "/login"
-    response:
-      status: 200
-  more:
-    nested:
-      fields: "another value"
-  user:
-    id: 123
-    name: "alice"
+├─ additional_info: "some value"
+├─ http:
+│  ├─ request:
+│  │  ├─ method: "POST"
+│  │  └─ path: "/login"
+│  └─ response:
+│     └─ status: 200
+├─ more:
+│  └─ nested:
+│     └─ fields: "another value"
+└─ user:
+   ├─ id: 123
+   └─ name: "alice"
 "#;
         assert_eq!(
             output.trim(),
@@ -499,9 +564,9 @@ mod tests {
 
         let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
         let expected = r#"INFO "user logged in"
-  http:
-    <value>: "this should NOT be overwritten"
-    method: "POST"
+└─ http:
+   ├─ <value>: "this should NOT be overwritten"
+   └─ method: "POST"
 "#;
         assert_eq!(
             output.trim(),
@@ -538,9 +603,9 @@ mod tests {
 
         let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
         let expected = r#"INFO "user logged in"
-  http:
-    <value>: "this should NOT be overwritten"
-    method: "POST"
+└─ http:
+   ├─ <value>: "this should NOT be overwritten"
+   └─ method: "POST"
 "#;
         assert_eq!(
             output.trim(),
@@ -576,10 +641,10 @@ mod tests {
 
         let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
         let expected = r#"INFO my_span
-  version: "1.0"
-  "user logged in"
-  user:
-    id: 123
+├─ version: "1.0"
+└─ "user logged in"
+   └─ user:
+      └─ id: 123
 "#;
         assert_eq!(
             output.trim(),
@@ -617,12 +682,12 @@ mod tests {
 
         let output = String::from_utf8(buf.lock().unwrap().to_vec()).unwrap();
         let expected = r#"INFO outer
-  outer_field: "outer_value"
-inner
-  inner_field: "inner_value"
-  "user logged in"
-  user:
-    id: 123
+├─ outer_field: "outer_value"
+└─ inner
+   ├─ inner_field: "inner_value"
+   └─ "user logged in"
+      └─ user:
+         └─ id: 123
 "#;
         assert_eq!(
             output.trim(),
